@@ -1,4 +1,5 @@
 <<<<<<< HEAD
+<<<<<<< HEAD
 # Telegram OpenWebUI Bot
 
 This project integrates a Telegram bot with [OpenWebUI](https://github.com/OpenWebUI/open-webui), enabling you to interact with a language model through Telegram. You can chat with the bot, summarize group chats, and maintain context using an external knowledge base if desired.
@@ -146,3 +147,6 @@ SOFTWARE.
 =======
 # telegram-openwebui-bot
 >>>>>>> main
+=======
+# telegram-openwebui-bot
+>>>>>>> 8a1b71e (Initial commit)
