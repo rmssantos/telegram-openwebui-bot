@@ -29,3 +29,4 @@ def save_data(data):
             json.dump(data, f, ensure_ascii=False, indent=4)
     except IOError as e:
         logger.error(f"Error saving data to file: {e}")
+
