@@ -1,98 +1,68 @@
 # services/summarize.py
 
-import requests
 import logging
-import re
-from config import OPENWEBUI_BASE_URL, OPENWEBUI_API_KEY, MODEL_NAME, MAX_TOKENS, TEMPERATURE
-from utils.history import get_last_24h_messages
-from utils.formatter import sanitize_html, replace_markdown_bold
+from config import SUMMARIZATION_HOURS, BASE_CHUNK_SIZE
+from utils.history import get_last_6h_raw_messages
+from services.chunk_processor import process_chunks, create_session_with_retry, call_openwebui
+from utils.formatter import add_emoticons_to_summary  # Import the new emoticon enhancer
 
 logger = logging.getLogger(__name__)
 
-def summarize_last_24h(chat_id, retries=3, timeout=30):
-    """
-    Generates a concise summary of the last 24 hours of chat messages using AI.
-
-    Args:
-        chat_id (int): The unique identifier for the chat.
-        retries (int): Number of retry attempts if the API request fails.
-        timeout (int): Timeout duration for the API request.
-
-    Returns:
-        str: The AI-generated summary of the chat.
-    """
-    messages_to_summarize = get_last_24h_messages(chat_id)
-    if not messages_to_summarize:
-        logger.debug("No messages to summarize.")
-        return "No messages in the last 24 hours."
-
-    headers = {
-        "Authorization": f"Bearer {OPENWEBUI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-
-    # Refined prompt
-    prompt = (
-        "Please provide a concise, numbered summary of the following chat messages. "
-        "Use only the following HTML tags for formatting in Telegram: <b>, <strong>, <i>, <em>, and <a>. "
-        "Each summary point should start with a number, followed by the username prefixed with '@' in bold, a colon, and a brief summary of the message.\n\n"
-        "Example:\n"
-        "1. <b>@Username:</b> Greeted everyone in the chat.\n"
-        "2. <b>@AnotherUser:</b> Responded with a greeting and asked about @Username's well-being.\n\n"
-        f"Chat Messages:\n{messages_to_summarize}"
+# 1) PARTIAL SUMMARIES
+def partial_summary_prompt(chunk, index, total):
+    return (
+        f"This is chunk {index}/{total} of a large group chat.\n"
+        "Summarize it in 2 bullet points (very concise):\n\n"
+        f"{chunk}\n"
     )
 
-    data = {
-        "model": MODEL_NAME,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "max_tokens": MAX_TOKENS,
-        "temperature": TEMPERATURE
-    }
+def partial_combine_fn(partial_summaries):
+    return "\n---\n".join(partial_summaries)
 
-    attempt = 0
-    while attempt < retries:
-        try:
-            logger.debug(f"Sending summarization request: {data}")
-            response = requests.post(
-                f"{OPENWEBUI_BASE_URL}/chat/completions",
-                headers=headers,
-                json=data,
-                timeout=timeout
-            )
-            logger.debug(f"Summarization response: {response.text}")
-            response.raise_for_status()
-            response_json = response.json()
+# 2) FINAL MERGE PROMPT
+def final_merge_prompt(partials_text):
+    return (
+        "You have multiple short partial summaries below.\n"
+        "Combine them into ONE final summary, strictly under 2500 characters.\n"
+        "Use at most 3 bullet points, plus 1 concluding sentence.\n\n"
+        f"PARTIAL SUMMARIES:\n{partials_text}\n\n"
+        "Now produce the final short summary (<2500 chars)."
+    )
 
-            if 'choices' in response_json and response_json['choices']:
-                summary = response_json['choices'][0]['message']['content'].strip()
+def summarize_categorized(chat_id, bot_username="Chat Summary"):
+    """
+    Returns a final short summary (<2500 chars) from the last X hours of chat,
+    enhanced with emoticons.
+    """
+    raw_messages = get_last_6h_raw_messages(chat_id, bot_username=bot_username, hours=SUMMARIZATION_HOURS)
+    if not raw_messages:
+        return "No messages in the last 6 hours."
 
-                # Remove code block markers if present
-                summary = summary.replace("```html", "").replace("```", "").strip()
+    text_to_summarize = "\n".join(
+        f"@{m['user']}: {m['text'].strip()}" for m in raw_messages
+    )
 
-                # Remove any unsupported tags just in case
-                allowed_tags = ['b', 'strong', 'i', 'em', 'a']
-                for tag in ['div', 'span', 'ol', 'li']:
-                    summary = re.sub(f"</?{tag}[^>]*>", "", summary, flags=re.IGNORECASE)
+    # 1) Partial summaries
+    partial_summaries_text = process_chunks(
+        text_to_summarize,
+        prompt_generator_fn=partial_summary_prompt,
+        combine_fn=partial_combine_fn,
+        chunk_size=BASE_CHUNK_SIZE,
+        parallel=True,
+        max_workers=2,
+        chunk_timeout=30
+    )
 
-                # Replace any remaining Markdown bold syntax with HTML bold tags
-                summary = re.sub(r'\*\*(.*?)\*\*', r'<b>\1</b>', summary)
+    # 2) Final unify
+    prompt = final_merge_prompt(partial_summaries_text)
+    session = create_session_with_retry()
+    final_summary = call_openwebui(prompt, session=session, timeout=60)
 
-                # Ensure usernames are prefixed with '@' within bold tags
-                summary = re.sub(r'<b>([^@][^:]+):</b>', r'<b>@\1:</b>', summary)
+    if len(final_summary) > 2500:
+        final_summary = final_summary[:2490] + "..."
 
-                # Ensure summary doesn't exceed Telegram's limit
-                if len(summary) > 4000:
-                    summary = summary[:4000] + "..."
-                return summary
-            return "I'm having trouble summarizing the chat history. Please try again later."
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Summarization request failed (attempt {attempt+1}/{retries}): {e}")
-            attempt += 1
+    # 3) Enhance with emoticons
+    final_summary_with_emoticons = add_emoticons_to_summary(final_summary)
 
-    return "There was an error processing the request after multiple attempts. Please try again later."
+    return final_summary_with_emoticons
 

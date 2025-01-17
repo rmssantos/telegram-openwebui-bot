@@ -1,122 +1,109 @@
-from datetime import datetime, timedelta
-from utils.data_manager import load_data, save_data
-from config import HISTORY_LENGTH
+# utils/history.py
+
 import logging
 import time
+from datetime import datetime
+from config import HISTORY_LENGTH, ROTATION_THRESHOLD_HOURS, SUMMARIZATION_HOURS
+
+# Import your new DB manager functions
+from utils.db_manager import (
+    init_db,
+    add_group_message,
+    get_group_messages_in_last_x_hours,
+    add_chat_history_message,
+    get_chat_history,
+    set_summary_metadata,
+    get_summary_metadata
+)
 
 logger = logging.getLogger(__name__)
 
-_data = load_data()
-chat_histories = _data.get("chat_histories", {})
-group_chat_logs = _data.get("group_chat_logs", {})
-
-# Control variables for batched persistence
+# Placeholder for persist rotation structure.
 _last_persist_time = time.time()
-_persist_interval = 30  # seconds between forced persists
+_persist_interval = 30  # seconds
 _changes_since_last_persist = 0
-_max_changes_before_persist = 5  # persist after this many changes
+_max_changes_before_persist = 5
 
-# Prune settings
-MAX_GROUP_MESSAGES = 1000  # Keep at most 1000 recent group messages
+# Initialize the database (creates tables if not present)
+init_db()
 
 def persist_data(force=False):
+    """
+    In SQLite, each write is immediately committed.
+    We'll keep this function for compatibility with your current code.
+    """
     global _last_persist_time, _changes_since_last_persist
-    if (force or 
-        _changes_since_last_persist >= _max_changes_before_persist or 
-        (time.time() - _last_persist_time) > _persist_interval):
-        data_to_save = {
-            "chat_histories": chat_histories,
-            "group_chat_logs": group_chat_logs
-        }
-        save_data(data_to_save)
-        _last_persist_time = time.time()
+    now = time.time()
+    if (force or
+        _changes_since_last_persist >= _max_changes_before_persist or
+        (now - _last_persist_time) > _persist_interval):
+        logger.debug("SQLite data is automatically persisted; no explicit save needed.")
+        _last_persist_time = now
         _changes_since_last_persist = 0
 
 def add_to_chat_history(chat_id, role, content, max_length=HISTORY_LENGTH):
-    cid = str(chat_id)
-    if cid not in chat_histories:
-        chat_histories[cid] = []
-    chat_histories[cid].append({"role": role, "content": content})
-    if len(chat_histories[cid]) > max_length:
-        chat_histories[cid] = chat_histories[cid][-max_length:]
+    """
+    Inserts a new message into the chat_histories table.
+    """
+    timestamp = datetime.now().isoformat()
+    add_chat_history_message(chat_id, role, content, timestamp)
     global _changes_since_last_persist
     _changes_since_last_persist += 1
     persist_data()
+    # Note: if you want to limit the number of messages, you can add deletion logic here.
 
 def log_group_message(message):
-    cid = str(message.chat.id)
-    if cid not in group_chat_logs:
-        group_chat_logs[cid] = []
-    group_chat_logs[cid].append({
-        "user": message.from_user.username or message.from_user.first_name,
-        "text": message.text,
-        "timestamp": datetime.now().isoformat()
-    })
-    # Prune old messages if too large
-    if len(group_chat_logs[cid]) > MAX_GROUP_MESSAGES:
-        group_chat_logs[cid] = group_chat_logs[cid][-MAX_GROUP_MESSAGES:]
+    """
+    Inserts a group message into the group_chat_logs table.
+    """
+    cid = message.chat.id
+    user = message.from_user.username or message.from_user.first_name
+    text = message.text
+    timestamp = datetime.now().isoformat()
+    add_group_message(cid, user, text, timestamp)
+    global _changes_since_last_persist
+    _changes_since_last_persist += 1
+    persist_data()
+    logger.debug(f"Logged message in cid={cid}, user={user}, text={text}")
+
+def get_last_6h_raw_messages(chat_id, bot_username="Chat Summary", hours=SUMMARIZATION_HOURS):
+    """
+    Returns messages from the last X hours from the DB.
+    """
+    return get_group_messages_in_last_x_hours(chat_id, hours=hours, bot_username=bot_username)
+
+def update_summary_metadata(
+    chat_id,
+    last_summary_time=None,
+    last_summary_result=None,
+    last_summary_message_ids=None,
+    last_warning_message_ids=None,
+    last_summarized_timestamp=None
+):
+    set_summary_metadata(
+        chat_id,
+        last_summary_time=last_summary_time.isoformat() if last_summary_time else None,
+        last_summary_result=last_summary_result,
+        last_summary_message_ids=last_summary_message_ids,
+        last_warning_message_ids=last_warning_message_ids,
+        last_summarized_timestamp=last_summarized_timestamp.isoformat() if last_summarized_timestamp else None
+    )
     global _changes_since_last_persist
     _changes_since_last_persist += 1
     persist_data()
 
-def get_last_24h_messages(chat_id, bot_username="Chat Summary"):
-    """
-    Retrieves the last 24 hours of messages from the specified chat, excluding messages
-    from the bot itself and any bot commands.
+def get_last_summary_message_ids(chat_id):
+    meta = get_summary_metadata(chat_id)
+    return meta.get("last_summary_message_ids", [])
 
-    Args:
-        chat_id (int): The unique identifier for the chat.
-        bot_username (str): The username of the bot to exclude its messages. Defaults to "Chat Summary".
+def get_last_warning_message_ids(chat_id):
+    meta = get_summary_metadata(chat_id)
+    return meta.get("last_warning_message_ids", [])
 
-    Returns:
-        str: A formatted string of recent messages suitable for summarization.
-    """
-    cid = str(chat_id)
-    if cid not in group_chat_logs:
-        return ""
-
-    now = datetime.now()
-    cutoff_time = now - timedelta(hours=24)
-    recent_messages = []
-
-    for msg in group_chat_logs[cid]:
-        try:
-            ts = datetime.fromisoformat(msg['timestamp'])
-        except ValueError:
-            # If timestamp format is incorrect, skip the message
-            continue
-
-        if ts >= cutoff_time:
-            # Exclude messages sent by the bot itself
-            if msg['user'].lower() == bot_username.lower():
-                continue
-
-            # Exclude messages that are bot commands (start with '/')
-            if msg['text'].strip().startswith('/'):
-                continue
-
-            # Optionally, exclude messages that are empty or contain only whitespace
-            if not msg['text'].strip():
-                continue
-
-            # Format the message with '@' prefix for usernames
-            # Ensure that the username doesn't already start with '@'
-            username = msg['user']
-            if not username.startswith('@'):
-                username = f"@{username}"
-
-            formatted_message = f"{username}: {msg['text'].strip()}"
-            recent_messages.append(formatted_message)
-
-    return "\n".join(recent_messages) if recent_messages else ""
-
-def get_chat_context(chat_id):
-    cid = str(chat_id)
-    return [f"{msg['role']}: {msg['content']}" for msg in chat_histories.get(cid, [])]
-
-def reset_chat_history(chat_id):
-    cid = str(chat_id)
-    chat_histories[cid] = []
-    # Force persist since this is a user-triggered action
-    persist_data(force=True)
+def get_last_summarized_timestamp(chat_id):
+    meta = get_summary_metadata(chat_id)
+    ts_str = meta.get("last_summarized_timestamp")
+    if ts_str:
+        return datetime.fromisoformat(ts_str)
+    return None
 
